@@ -20,6 +20,13 @@ public class ApiVideoLiveStream {
     private var isAudioConfigured = false
     private var isVideoConfigured = false
 
+    // MultiCam integration
+    #if os(iOS)
+    @available(iOS 13.0, *)
+    private var multiCamController: MultiCameraController?
+    private var useMultiCam = false
+    #endif
+
     /// The delegate of the ApiVideoLiveStream
     public weak var delegate: ApiVideoLiveStreamDelegate?
 
@@ -66,12 +73,27 @@ public class ApiVideoLiveStream {
     /// Camera position
     public var cameraPosition: AVCaptureDevice.Position {
         get {
+            #if os(iOS)
+            if #available(iOS 13.0, *), useMultiCam, let multiCam = multiCamController {
+                return multiCam.activeCamera == .front ? .front : .back
+            }
+            #endif
             guard let position = rtmpStream.videoCapture(for: 0)?.device?.position else {
                 return AVCaptureDevice.Position.unspecified
             }
             return position
         }
         set(newValue) {
+            #if os(iOS)
+            if #available(iOS 13.0, *), useMultiCam, let multiCam = multiCamController {
+                do {
+                    try multiCam.switchCamera()
+                } catch {
+                    print("[ApiVideo] MultiCam switch failed: \(error)")
+                }
+                return
+            }
+            #endif
             self.attachCamera(newValue)
         }
     }
@@ -155,16 +177,43 @@ public class ApiVideoLiveStream {
         }
         #endif
 
+        // Initialize camera with MultiCam support
         if let initialCamera = initialCamera {
+            #if os(iOS)
+            if #available(iOS 13.0, *) {
+                NSLog("[ApiVideo] iOS 13+ detected, checking MultiCam support...")
+                NSLog("[ApiVideo] MultiCam.isSupported = \(MultiCameraController.isSupported)")
+                if MultiCameraController.isSupported {
+                    NSLog("[ApiVideo] ✅ MultiCam supported! Using position-based init")
+                    self.attachCamera(initialCamera.position)
+                } else {
+                    NSLog("[ApiVideo] ❌ MultiCam NOT supported, using legacy init")
+                    self.attachCamera(initialCamera)
+                }
+            } else {
+                NSLog("[ApiVideo] iOS < 13, using legacy init")
+                self.attachCamera(initialCamera)
+            }
+            #else
             self.attachCamera(initialCamera)
+            #endif
         }
         if let initialVideoConfig = initialVideoConfig {
             self.prepareVideo(videoConfig: initialVideoConfig)
         }
 
-        self.attachAudio()
+        // ALWAYS configure audio settings (sets bitrate, marks isAudioConfigured = true)
+        // This is required for stream validation and RTMP encoder configuration
         if let initialAudioConfig = initialAudioConfig {
             self.prepareAudio(audioConfig: initialAudioConfig)
+        }
+
+        // ONLY attach legacy audio capture if MultiCam is NOT active
+        // MultiCam provides its own audio via delegate (prevents dual audio sources)
+        if !useMultiCam {
+            self.attachAudio()
+        } else {
+            NSLog("[ApiVideo] ✅ MultiCam active - using MultiCam audio capture (legacy attachAudio skipped)")
         }
 
         #if !os(macOS)
@@ -271,6 +320,13 @@ public class ApiVideoLiveStream {
     }
 
     private func attachCamera(_ cameraPosition: AVCaptureDevice.Position) {
+        #if os(iOS)
+        if #available(iOS 13.0, *), MultiCameraController.isSupported {
+            setupMultiCam(initialPosition: cameraPosition)
+            return
+        }
+        #endif
+
         let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition)
         self.attachCamera(camera)
     }
@@ -278,11 +334,22 @@ public class ApiVideoLiveStream {
     private func attachCamera(_ camera: AVCaptureDevice?) {
         self.lastCamera = camera
 
+        // HaishinKit 1.7.3: attachCamera has channel parameter with configuration callback
         self.rtmpStream.attachCamera(camera, channel: 0) { videoCaptureUnit, error in
             if let error {
                 print("======== Camera error ==========")
                 print(error)
-                self.delegate?.videoError(error)
+                // error is IOVideoUnitError, extract underlying Error if available
+                switch error {
+                case .failedToAttach(let underlyingError):
+                    if let underlyingError {
+                        self.delegate?.videoError(underlyingError)
+                    } else {
+                        self.delegate?.videoError(error)  // Pass IOVideoUnitError itself
+                    }
+                default:
+                    self.delegate?.videoError(error)
+                }
                 return
             }
 
@@ -300,8 +367,8 @@ public class ApiVideoLiveStream {
             self.rtmpStream.lockQueue.async {
                 do {
                     try device.lockForConfiguration()
-                    if device.isExposureModeSupported(.continuousAutoExposure) {
-                        device.exposureMode = .continuousAutoExposure
+                    if device.isExposureModeSupported(AVCaptureDevice.ExposureMode.continuousAutoExposure) {
+                        device.exposureMode = AVCaptureDevice.ExposureMode.continuousAutoExposure
                     }
                     if device.isFocusModeSupported(.continuousAutoFocus) {
                         device.focusMode = .continuousAutoFocus
@@ -313,6 +380,30 @@ public class ApiVideoLiveStream {
             }
         }
     }
+
+    #if os(iOS)
+    @available(iOS 13.0, *)
+    private func setupMultiCam(initialPosition: AVCaptureDevice.Position) {
+        NSLog("[ApiVideo] 🎬 setupMultiCam called with position: \(initialPosition)")
+        let controller = MultiCameraController()
+        controller.delegate = self
+
+        let cameraPos: CameraPosition = initialPosition == .front ? .front : .back
+        NSLog("[ApiVideo] Attempting MultiCam setup...")
+        do {
+            try controller.setup(initialCamera: cameraPos)
+            NSLog("[ApiVideo] MultiCam setup() succeeded, starting...")
+            controller.start()
+            multiCamController = controller
+            useMultiCam = true
+            NSLog("[ApiVideo] ✅ ✅ ✅ MULTICAM MODE ACTIVE - INSTANT SWITCHING ENABLED ✅ ✅ ✅")
+        } catch {
+            NSLog("[ApiVideo] ❌ MultiCam setup failed: \(error), falling back to legacy")
+            let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: initialPosition)
+            attachCamera(camera)
+        }
+    }
+    #endif
 
     private func prepareVideo(videoConfig: VideoConfig) {
         self.rtmpStream.frameRate = videoConfig.fps
@@ -343,9 +434,10 @@ public class ApiVideoLiveStream {
     }
 
     private func prepareAudio(audioConfig: AudioConfig) {
-        self.rtmpStream.audioSettings = AudioCodecSettings(
-            bitRate: audioConfig.bitrate
-        )
+        // HaishinKit 1.7.3 uses AudioCodecSettings.default with bitRate property
+        var audioSettings = AudioCodecSettings()
+        audioSettings.bitRate = audioConfig.bitrate
+        self.rtmpStream.audioSettings = audioSettings
 
         self.isAudioConfigured = true
     }
@@ -388,11 +480,16 @@ public class ApiVideoLiveStream {
             return
         }
         self.attachCamera(lastCamera)
-        self.attachAudio()
+
+        // Audio attachment removed - already handled in init()
+        // - MultiCam mode: Uses delegate audio (didOutputAudioSampleBuffer)
+        // - Legacy mode: Already attached in init() at line 214
+        // DO NOT attach audio here - causes duplicate audio sources (3-channel chaos)
     }
 
     public func stopPreview() {
-        self.rtmpStream.attachCamera(nil, channel: 0)
+        // HaishinKit 1.7.3 doesn't have channel parameter
+        self.rtmpStream.attachCamera(nil)
         self.rtmpStream.attachAudio(nil)
     }
 
@@ -495,3 +592,28 @@ public enum LiveStreamError: Error {
     case IllegalArgumentError(String)
     case IllegalOperationError(String)
 }
+
+
+// MARK: - MultiCameraControllerDelegate
+#if os(iOS)
+@available(iOS 13.0, *)
+extension ApiVideoLiveStream: MultiCameraControllerDelegate {
+    public func multiCameraController(_ controller: MultiCameraController,
+                                      didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
+        // HaishinKit 1.7.3: IOStream.append() auto-detects media type
+        rtmpStream.append(sampleBuffer)
+    }
+
+    public func multiCameraController(_ controller: MultiCameraController,
+                                      didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer) {
+        // MultiCam audio source (only active when useMultiCam == true)
+        // Legacy attachAudio() is disabled when MultiCam is active to prevent dual audio sources
+        rtmpStream.append(sampleBuffer)
+    }
+
+    public func multiCameraController(_ controller: MultiCameraController,
+                                      didSwitchTo camera: CameraPosition) {
+        print("[ApiVideo] ✅ Switched to \(camera) camera")
+    }
+}
+#endif
