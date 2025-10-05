@@ -336,19 +336,19 @@ public class ApiVideoLiveStream {
 
         // HaishinKit 1.7.3: attachCamera has channel parameter with configuration callback
         self.rtmpStream.attachCamera(camera, channel: 0) { videoCaptureUnit, error in
-            if let error {
+            if let err = error {
                 print("======== Camera error ==========")
-                print(error)
+                print(err)
                 // error is IOVideoUnitError, extract underlying Error if available
-                switch error {
+                switch err {
                 case .failedToAttach(let underlyingError):
                     if let underlyingError {
                         self.delegate?.videoError(underlyingError)
                     } else {
-                        self.delegate?.videoError(error)  // Pass IOVideoUnitError itself
+                        self.delegate?.videoError(err)  // Pass IOVideoUnitError itself
                     }
                 default:
-                    self.delegate?.videoError(error)
+                    self.delegate?.videoError(err)
                 }
                 return
             }
@@ -396,6 +396,11 @@ public class ApiVideoLiveStream {
             controller.start()
             multiCamController = controller
             useMultiCam = true
+            // Disable HaishinKit’s internal microphone graph to prevent duplicate audio
+            self.rtmpStream.attachAudio(nil)
+            self.rtmpStream.hasAudio = true  // keep encoder active
+            NSLog("[ApiVideo] 🧩 Detached default HaishinKit audio input (MultiCam handles audio)")
+
             NSLog("[ApiVideo] ✅ ✅ ✅ MULTICAM MODE ACTIVE - INSTANT SWITCHING ENABLED ✅ ✅ ✅")
         } catch {
             NSLog("[ApiVideo] ❌ MultiCam setup failed: \(error), falling back to legacy")
