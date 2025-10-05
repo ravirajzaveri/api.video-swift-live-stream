@@ -89,21 +89,14 @@ public class ApiVideoLiveStream {
     /// Mutes or unmutes audio capture.
     public var isMuted: Bool {
         get {
-            self.rtmpStream.audioMixerSettings.isMuted
+            !self.rtmpStream.hasAudio
         }
         set(newValue) {
-            self.rtmpStream.audioMixerSettings.isMuted = newValue
+            self.rtmpStream.hasAudio = !newValue
         }
     }
 
     #if os(iOS)
-    public var zoomRatioRange: Range<CGFloat> {
-        guard let device = rtmpStream.videoCapture(for: 0)?.device else {
-            return 1.0 ..< 1.0
-        }
-        return 1.0 ..< device.activeFormat.videoMaxZoomFactor
-    }
-
     /// Zoom on the video capture
     public var zoomRatio: CGFloat {
         get {
@@ -114,7 +107,7 @@ public class ApiVideoLiveStream {
         }
         set(newValue) {
             guard let device = rtmpStream.videoCapture(for: 0)?.device, newValue >= 1,
-                  newValue <= device.activeFormat.videoMaxZoomFactor else
+                  newValue < device.activeFormat.videoMaxZoomFactor else
             {
                 return
             }
@@ -249,7 +242,7 @@ public class ApiVideoLiveStream {
     ///   - initialVideoConfig: The ApiVideoLiveStream's new VideoConfig
     ///   - initialCamera: The ApiVideoLiveStream's initial camera device
     public convenience init(
-        preview: IOStreamView,
+        preview: IOStreamDrawable,
         initialAudioConfig: AudioConfig? = AudioConfig(),
         initialVideoConfig: VideoConfig? = VideoConfig(),
         initialCamera: AVCaptureDevice? = AVCaptureDevice.default(
@@ -285,7 +278,7 @@ public class ApiVideoLiveStream {
     private func attachCamera(_ camera: AVCaptureDevice?) {
         self.lastCamera = camera
 
-        self.rtmpStream.attachCamera(camera) { videoCaptureUnit, error in
+        self.rtmpStream.attachCamera(camera, channel: 0) { videoCaptureUnit, error in
             if let error {
                 print("======== Camera error ==========")
                 print(error)
@@ -342,17 +335,17 @@ public class ApiVideoLiveStream {
     }
 
     private func attachAudio() {
-        self.rtmpStream.attachAudio(AVCaptureDevice.default(for: AVMediaType.audio)) { _, error in
-            if let error {
-                print("======== Audio error ==========")
-                print(error)
-                self.delegate?.audioError(error)
-            }
+        self.rtmpStream.attachAudio(AVCaptureDevice.default(for: AVMediaType.audio)) { error in
+            print("======== Audio error ==========")
+            print(error)
+            self.delegate?.audioError(error)
         }
     }
 
     private func prepareAudio(audioConfig: AudioConfig) {
-        self.rtmpStream.audioSettings.bitRate = audioConfig.bitrate
+        self.rtmpStream.audioSettings = AudioCodecSettings(
+            bitRate: audioConfig.bitrate
+        )
 
         self.isAudioConfigured = true
     }
@@ -376,7 +369,6 @@ public class ApiVideoLiveStream {
         self.streamKey = streamKey
         self.url = url
 
-        self.rtmpStream.fcPublishName = streamKey
         self.rtmpConnection.connect(url)
     }
 
@@ -400,7 +392,7 @@ public class ApiVideoLiveStream {
     }
 
     public func stopPreview() {
-        self.rtmpStream.attachCamera(nil)
+        self.rtmpStream.attachCamera(nil, channel: 0)
         self.rtmpStream.attachAudio(nil)
     }
 
