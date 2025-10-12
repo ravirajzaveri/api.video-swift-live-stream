@@ -666,12 +666,12 @@ public class ApiVideoLiveStream {
     }
 
     public func updateSubGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: Pass to VideoProcessor's OverlayRenderer
+        videoProcessor?.updateSubGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
     }
 
     public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: Pass to VideoProcessor's OverlayRenderer
+        videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
     }
 }
