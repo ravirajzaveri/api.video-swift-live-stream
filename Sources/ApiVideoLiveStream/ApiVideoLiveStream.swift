@@ -666,12 +666,14 @@ public class ApiVideoLiveStream {
     }
 
     public func updateSubGoal(current: Int, target: Int, visible: Bool) {
-        videoProcessor?.updateSubGoal(current: current, target: target, visible: visible)
+        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
+        // videoProcessor?.updateSubGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
     }
 
     public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
-        videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
+        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
+        // videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
     }
 }
