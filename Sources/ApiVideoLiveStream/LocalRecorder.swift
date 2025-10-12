@@ -20,6 +20,7 @@ class LocalRecorder: NSObject {
     private var outputURL: URL?
     private var isRecording = false
     private var sessionStartTime: CMTime?
+    private var videoSettingsConfigured = false // Track if video settings are set from first frame
 
     override init() {
         super.init()
@@ -46,18 +47,9 @@ class LocalRecorder: NSObject {
         // Create asset writer
         let writer = try AVAssetWriter(outputURL: fileURL, fileType: .mp4)
 
-        // Video settings: 720p H.264
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: 1280,
-            AVVideoHeightKey: 720,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 2500000, // 2.5 Mbps
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-            ]
-        ]
-
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        // Video settings: Will be configured from first frame to match actual orientation
+        // Use nil settings initially - we'll configure from first CMSampleBuffer dimensions
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
         videoInput.expectsMediaDataInRealTime = true
 
         // Audio settings: AAC 128kbps
@@ -101,8 +93,10 @@ class LocalRecorder: NSObject {
         self.outputURL = fileURL
         self.isRecording = true
         self.sessionStartTime = nil
+        self.videoSettingsConfigured = false
 
         print("[LocalRecorder] ✅ Recording started to: \(fileURL.path)")
+        print("[LocalRecorder] ⏳ Video dimensions will be set from first frame")
     }
 
     /// Append video sample buffer
@@ -118,6 +112,46 @@ class LocalRecorder: NSObject {
                 print("[LocalRecorder] ❌ Writer in failed state, error: \(writer.error?.localizedDescription ?? "unknown")")
             }
             return
+        }
+
+        // Configure video settings from first frame to match actual dimensions
+        if !videoSettingsConfigured {
+            guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+                print("[LocalRecorder] ⚠️ No format description on first frame")
+                return
+            }
+
+            let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+            let width = Int(dimensions.width)
+            let height = Int(dimensions.height)
+
+            print("[LocalRecorder] 📐 Detected video dimensions from first frame: \(width)x\(height)")
+
+            // Create new video input with actual dimensions
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: 2500000, // 2.5 Mbps
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+
+            let newVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            newVideoInput.expectsMediaDataInRealTime = true
+
+            // Replace the nil-settings input with properly configured one
+            writer.remove(videoInput)
+            if writer.canAdd(newVideoInput) {
+                writer.add(newVideoInput)
+                self.videoInput = newVideoInput
+                videoSettingsConfigured = true
+                print("[LocalRecorder] ✅ Video input reconfigured with \(width)x\(height)")
+            } else {
+                print("[LocalRecorder] ❌ Cannot add reconfigured video input")
+                return
+            }
         }
 
         // Start session on first video frame
@@ -240,6 +274,7 @@ class LocalRecorder: NSObject {
             self.audioInput = nil
             self.outputURL = nil
             self.sessionStartTime = nil
+            self.videoSettingsConfigured = false
         }
     }
 
@@ -265,5 +300,6 @@ class LocalRecorder: NSObject {
         audioInput = nil
         outputURL = nil
         sessionStartTime = nil
+        videoSettingsConfigured = false
     }
 }

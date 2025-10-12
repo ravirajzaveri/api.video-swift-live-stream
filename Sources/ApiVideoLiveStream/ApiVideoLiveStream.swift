@@ -676,6 +676,21 @@ public class ApiVideoLiveStream {
         // videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
     }
+
+    public func updateOverlayTexture(
+        kind: String,
+        bytes: Data,
+        width: Int,
+        height: Int,
+        left: CGFloat,
+        top: CGFloat,
+        overlayWidth: CGFloat,
+        overlayHeight: CGFloat
+    ) {
+        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
+        // For now, just log the call - actual Metal texture update will be implemented later
+        print("📊 ApiVideoLiveStream: updateOverlayTexture - kind: \(kind), size: \(width)x\(height), position: (\(left), \(top)), overlay size: \(overlayWidth)x\(overlayHeight), bytes: \(bytes.count)")
+    }
 }
 
 public protocol ApiVideoLiveStreamDelegate: AnyObject {
