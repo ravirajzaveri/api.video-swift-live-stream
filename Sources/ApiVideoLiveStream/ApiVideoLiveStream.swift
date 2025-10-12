@@ -25,6 +25,63 @@ public class ApiVideoLiveStream {
     @available(iOS 13.0, *)
     private var multiCamController: MultiCameraController?
     private var useMultiCam = false
+    private var orientationUpdatesEnabled = true
+    #endif
+
+    // Local recording
+    private var localRecorder: LocalRecorder?
+
+    #if os(iOS)
+    private func currentVideoOrientation() -> AVCaptureVideoOrientation? {
+        // ALWAYS use device physical orientation sensors, never UI interface orientation
+        // This ensures correct video rotation even when UI is locked portrait
+        let deviceOrientation = UIDevice.current.orientation
+
+        if deviceOrientation != .unknown,
+           deviceOrientation != .faceUp,
+           deviceOrientation != .faceDown,
+           let orientation = DeviceUtil.videoOrientation(by: deviceOrientation) {
+            return orientation
+        }
+
+        // Fallback to portrait only if device orientation is unavailable
+        // DO NOT check interfaceOrientation - it reflects UI lock, not physical device rotation
+        return DeviceUtil.videoOrientation(by: UIDeviceOrientation.portrait)
+    }
+
+    private func applyVideoOrientation(_ orientation: AVCaptureVideoOrientation) {
+        self.rtmpStream.lockQueue.async {
+            self.rtmpStream.videoOrientation = orientation
+
+            if let captureUnit = self.rtmpStream.videoCapture(for: 0) {
+                captureUnit.videoOrientation = orientation
+            }
+
+            let currentVideoSize = self.rtmpStream.videoSettings.videoSize
+            let isLandscape = orientation.isLandscape
+            let targetWidth = isLandscape
+                ? max(currentVideoSize.width, currentVideoSize.height)
+                : min(currentVideoSize.width, currentVideoSize.height)
+            let targetHeight = isLandscape
+                ? min(currentVideoSize.width, currentVideoSize.height)
+                : max(currentVideoSize.width, currentVideoSize.height)
+
+            self.rtmpStream.videoSettings.videoSize = CGSize(width: targetWidth, height: targetHeight)
+        }
+
+        if #available(iOS 13.0, *), useMultiCam, let multiCamController = multiCamController {
+            DispatchQueue.main.async {
+                multiCamController.setOrientation(orientation)
+            }
+        }
+    }
+
+    public func setOrientationUpdatesEnabled(_ enabled: Bool) {
+        orientationUpdatesEnabled = enabled
+        if !enabled, let orientation = currentVideoOrientation() {
+            applyVideoOrientation(orientation)
+        }
+    }
     #endif
 
     /// The delegate of the ApiVideoLiveStream
@@ -159,6 +216,7 @@ public class ApiVideoLiveStream {
         )
     ) throws {
         #if os(iOS)
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         let session = AVAudioSession.sharedInstance()
 
         // https://stackoverflow.com/questions/51010390/avaudiosession-setcategory-swift-4-2-ios-12-play-sound-on-silent
@@ -172,8 +230,8 @@ public class ApiVideoLiveStream {
         self.rtmpStream.videoSettings = VideoCodecSettings(videoSize: .init(width: 1_280, height: 720))
 
         #if os(iOS)
-        if let orientation = DeviceUtil.videoOrientation(by: UIApplication.shared.statusBarOrientation) {
-            self.rtmpStream.videoOrientation = orientation
+        if let orientation = currentVideoOrientation() {
+            applyVideoOrientation(orientation)
         }
         #endif
 
@@ -310,6 +368,7 @@ public class ApiVideoLiveStream {
 
     deinit {
         #if os(iOS)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
         #endif
         #if !os(macOS)
@@ -356,6 +415,9 @@ public class ApiVideoLiveStream {
             if let camera {
                 videoCaptureUnit?.isVideoMirrored = camera.position == .front
             }
+            if let orientation = self.currentVideoOrientation() {
+                videoCaptureUnit?.videoOrientation = orientation
+            }
             #if os(iOS)
             // videoCaptureUnit.preferredVideoStabilizationMode = AVCaptureVideoStabilizationMode
             //   .auto // Add latency to video
@@ -396,6 +458,9 @@ public class ApiVideoLiveStream {
             controller.start()
             multiCamController = controller
             useMultiCam = true
+            if let orientation = self.currentVideoOrientation() {
+                controller.setOrientation(orientation)
+            }
             // Disable HaishinKit’s internal microphone graph to prevent duplicate audio
             self.rtmpStream.attachAudio(nil)
             self.rtmpStream.hasAudio = true  // keep encoder active
@@ -479,6 +544,35 @@ public class ApiVideoLiveStream {
         }
     }
 
+    // MARK: - Local Recording
+    /// Start recording stream to local file
+    /// - Throws: Error if recording cannot be started
+    public func startLocalRecording() throws {
+        NSLog("[ApiVideoLiveStream] startLocalRecording() called")
+        if localRecorder == nil {
+            NSLog("[ApiVideoLiveStream] Creating new LocalRecorder instance")
+            localRecorder = LocalRecorder()
+        } else {
+            NSLog("[ApiVideoLiveStream] Reusing existing LocalRecorder instance")
+        }
+        NSLog("[ApiVideoLiveStream] Calling localRecorder.startRecording()")
+        try localRecorder?.startRecording()
+        NSLog("[ApiVideoLiveStream] startLocalRecording() completed successfully")
+    }
+
+    /// Stop recording and return local file URL
+    /// - Parameter completion: Callback with file URL (nil if recording failed)
+    public func stopLocalRecording(completion: @escaping (URL?) -> Void) {
+        NSLog("[ApiVideoLiveStream] stopLocalRecording() called")
+        if localRecorder == nil {
+            NSLog("[ApiVideoLiveStream] ❌ localRecorder is nil - cannot stop recording")
+            completion(nil)
+            return
+        }
+        NSLog("[ApiVideoLiveStream] Calling localRecorder.stopRecording()")
+        localRecorder?.stopRecording(completion: completion)
+    }
+
     public func startPreview() {
         guard let lastCamera = lastCamera else {
             print("No camera has been set")
@@ -537,28 +631,13 @@ public class ApiVideoLiveStream {
     #if os(iOS)
     @objc
     private func orientationDidChange(_: Notification) {
-        guard let orientation = DeviceUtil.videoOrientation(by: UIApplication.shared.statusBarOrientation) else {
+        guard orientationUpdatesEnabled else {
             return
         }
-
-        self.rtmpStream.lockQueue.async {
-            self.rtmpStream.videoOrientation = orientation
-
-            let currentVideoSize = self.rtmpStream.videoSettings.videoSize
-            var newVideoSize: CGSize
-            if self.rtmpStream.videoOrientation.isLandscape {
-                newVideoSize = CGSize(
-                    width: max(currentVideoSize.width, currentVideoSize.height),
-                    height: min(currentVideoSize.width, currentVideoSize.height)
-                )
-            } else {
-                newVideoSize = CGSize(
-                    width: min(currentVideoSize.width, currentVideoSize.height),
-                    height: max(currentVideoSize.width, currentVideoSize.height)
-                )
-            }
-            self.rtmpStream.videoSettings.videoSize = newVideoSize
+        guard let orientation = currentVideoOrientation() else {
+            return
         }
+        applyVideoOrientation(orientation)
     }
     #endif
 
@@ -599,14 +678,77 @@ public enum LiveStreamError: Error {
 }
 
 
+    // MARK: - VideoProcessor Integration
+    private var videoProcessor: VideoProcessor?
+
+    public func enableOverlayCompositing() {
+        guard let processor = VideoProcessor() else {
+            print("❌ ApiVideoLiveStream: Could not initialize VideoProcessor")
+            return
+        }
+        videoProcessor = processor
+        print("✅ ApiVideoLiveStream: Overlay compositing enabled")
+    }
+
+    public func disableOverlayCompositing() {
+        videoProcessor = nil
+        print("✅ ApiVideoLiveStream: Overlay compositing disabled")
+    }
+
+    public func updateSubGoal(current: Int, target: Int, visible: Bool) {
+        // TODO: Pass to VideoProcessor's OverlayRenderer
+        print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
+    }
+
+    public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
+        // TODO: Pass to VideoProcessor's OverlayRenderer
+        print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
+    }
+
 // MARK: - MultiCameraControllerDelegate
 #if os(iOS)
 @available(iOS 13.0, *)
 extension ApiVideoLiveStream: MultiCameraControllerDelegate {
     public func multiCameraController(_ controller: MultiCameraController,
                                       didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
+        var finalSampleBuffer = sampleBuffer
+
+        // Apply overlay compositing if enabled
+        if let processor = videoProcessor,
+           let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+           let processedBuffer = processor.process(pixelBuffer: imageBuffer) {
+            // Create new CMSampleBuffer with processed pixel buffer
+            // Reuse original timing info for A/V sync
+            var newSampleBuffer: CMSampleBuffer?
+            var timingInfo = CMSampleTimingInfo()
+            CMSampleBufferGetSampleTimingInfo(sampleBuffer, at: 0, timingInfoOut: &timingInfo)
+
+            var formatDescription: CMFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: processedBuffer,
+                formatDescriptionOut: &formatDescription
+            )
+
+            if let formatDescription = formatDescription {
+                CMSampleBufferCreateReadyWithImageBuffer(
+                    allocator: kCFAllocatorDefault,
+                    imageBuffer: processedBuffer,
+                    formatDescription: formatDescription,
+                    sampleTiming: &timingInfo,
+                    sampleBufferOut: &newSampleBuffer
+                )
+
+                if let newSampleBuffer = newSampleBuffer {
+                    finalSampleBuffer = newSampleBuffer
+                }
+            }
+        }
+
         // HaishinKit 1.7.3: IOStream.append() auto-detects media type
-        rtmpStream.append(sampleBuffer)
+        rtmpStream.append(finalSampleBuffer)
+        // Feed video to local recorder
+        localRecorder?.appendVideo(sampleBuffer: finalSampleBuffer)
     }
 
     public func multiCameraController(_ controller: MultiCameraController,
@@ -614,6 +756,8 @@ extension ApiVideoLiveStream: MultiCameraControllerDelegate {
         // MultiCam audio source (only active when useMultiCam == true)
         // Legacy attachAudio() is disabled when MultiCam is active to prevent dual audio sources
         rtmpStream.append(sampleBuffer)
+        // Feed audio to local recorder
+        localRecorder?.appendAudio(sampleBuffer: sampleBuffer)
     }
 
     public func multiCameraController(_ controller: MultiCameraController,

@@ -9,6 +9,8 @@
 #if os(iOS)
 import AVFoundation
 import Foundation
+import HaishinKit
+import UIKit
 
 /// Position of camera device
 public enum CameraPosition {
@@ -33,6 +35,7 @@ public class MultiCameraController: NSObject {
 
     private(set) var activeCamera: CameraPosition = .front
     private var isConfigured = false
+    private var currentOrientation: AVCaptureVideoOrientation = .portrait
 
     /// Delegate for receiving video/audio samples
     public weak var delegate: MultiCameraControllerDelegate?
@@ -70,12 +73,15 @@ public class MultiCameraController: NSObject {
 
         // Connect active camera to outputs
         activeCamera = initialCamera
+        currentOrientation = resolveOrientation()
         connectCamera(activeCamera, to: session)
 
         session.commitConfiguration()
 
         multiCamSession = session
         isConfigured = true
+
+        setOrientation(currentOrientation)
 
         print("[MultiCam] ✅ Setup complete - both cameras ready")
     }
@@ -130,6 +136,8 @@ public class MultiCameraController: NSObject {
         print("[MultiCam] ⚡ Camera switched in \(Int(elapsed))ms")
 
         delegate?.multiCameraController(self, didSwitchTo: activeCamera)
+
+        setOrientation(currentOrientation)
     }
 
     /// Cleanup and release resources
@@ -272,7 +280,7 @@ public class MultiCameraController: NSObject {
 
         // Configure connection
         if connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
+            connection.videoOrientation = currentOrientation
         }
 
         // Mirror front camera
@@ -286,6 +294,23 @@ public class MultiCameraController: NSObject {
             print("[MultiCam] ✅ Connected \(position) camera to output")
         } else {
             print("[MultiCam] ❌ Cannot add connection for \(position) camera")
+        }
+    }
+
+    private func resolveOrientation() -> AVCaptureVideoOrientation {
+        let deviceOrientation = UIDevice.current.orientation
+        if let orientation = DeviceUtil.videoOrientation(by: deviceOrientation) {
+            return orientation
+        }
+        return .portrait
+    }
+
+    public func setOrientation(_ orientation: AVCaptureVideoOrientation) {
+        currentOrientation = orientation
+        guard let videoOutput = videoDataOutput else { return }
+
+        for connection in videoOutput.connections where connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
         }
     }
 }
