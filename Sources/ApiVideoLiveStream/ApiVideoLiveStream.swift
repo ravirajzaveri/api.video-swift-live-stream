@@ -647,6 +647,33 @@ public class ApiVideoLiveStream {
         self.stopStreaming()
     }
     #endif
+
+    // MARK: - VideoProcessor Integration
+    private var videoProcessor: VideoProcessor?
+
+    public func enableOverlayCompositing() {
+        guard let processor = VideoProcessor() else {
+            print("❌ ApiVideoLiveStream: Could not initialize VideoProcessor")
+            return
+        }
+        videoProcessor = processor
+        print("✅ ApiVideoLiveStream: Overlay compositing enabled")
+    }
+
+    public func disableOverlayCompositing() {
+        videoProcessor = nil
+        print("✅ ApiVideoLiveStream: Overlay compositing disabled")
+    }
+
+    public func updateSubGoal(current: Int, target: Int, visible: Bool) {
+        // TODO: Pass to VideoProcessor's OverlayRenderer
+        print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
+    }
+
+    public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
+        // TODO: Pass to VideoProcessor's OverlayRenderer
+        print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
+    }
 }
 
 public protocol ApiVideoLiveStreamDelegate: AnyObject {
@@ -676,34 +703,6 @@ public enum LiveStreamError: Error {
     case IllegalArgumentError(String)
     case IllegalOperationError(String)
 }
-
-
-    // MARK: - VideoProcessor Integration
-    private var videoProcessor: VideoProcessor?
-
-    public func enableOverlayCompositing() {
-        guard let processor = VideoProcessor() else {
-            print("❌ ApiVideoLiveStream: Could not initialize VideoProcessor")
-            return
-        }
-        videoProcessor = processor
-        print("✅ ApiVideoLiveStream: Overlay compositing enabled")
-    }
-
-    public func disableOverlayCompositing() {
-        videoProcessor = nil
-        print("✅ ApiVideoLiveStream: Overlay compositing disabled")
-    }
-
-    public func updateSubGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: Pass to VideoProcessor's OverlayRenderer
-        print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
-    }
-
-    public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: Pass to VideoProcessor's OverlayRenderer
-        print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
-    }
 
 // MARK: - MultiCameraControllerDelegate
 #if os(iOS)
