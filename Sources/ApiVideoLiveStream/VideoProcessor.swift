@@ -17,6 +17,7 @@ import Metal
 import MetalKit
 import Dispatch
 
+#if !os(macOS)
 class VideoProcessor {
     // Metal resources
     private let device: MTLDevice
@@ -27,6 +28,13 @@ class VideoProcessor {
     private var overlayTextureHeap: MTLHeap?
     private var subGoalTexture: MTLTexture?
     private var followerGoalTexture: MTLTexture?
+    private var chatTexture: MTLTexture?
+
+    // Overlay renderer (native CALayer rendering - DEPRECATED, use WebView capture instead)
+    private var overlayRenderer: OverlayRenderer?
+
+    // WebView capture manager (captures Flutter WebViews as Metal textures)
+    private var webViewCaptureManager: OverlayCaptureManager?
 
     // Render pipeline states
     private var yuvRenderPipelineState: MTLRenderPipelineState!
@@ -43,10 +51,13 @@ class VideoProcessor {
 
     // Overlay state (controlled via Flutter API)
     struct OverlayState {
+        var chatVisible: Bool = false
         var subGoalVisible: Bool = false
         var followerGoalVisible: Bool = false
+        var chatRect: CGRect = .zero
         var subGoalRect: CGRect = .zero
         var followerGoalRect: CGRect = .zero
+        var chatOpacity: Float = 1.0
         var subGoalOpacity: Float = 1.0
         var followerGoalOpacity: Float = 1.0
     }
@@ -75,7 +86,80 @@ class VideoProcessor {
             return nil
         }
 
-        print("✅ VideoProcessor: Initialized successfully")
+        // Initialize overlay renderer (DEPRECATED - fallback only)
+        self.overlayRenderer = OverlayRenderer(device: device)
+
+        // Initialize WebView capture manager (primary overlay source)
+        self.webViewCaptureManager = OverlayCaptureManager(device: device)
+
+        if webViewCaptureManager != nil {
+            print("✅ VideoProcessor: Initialized with WebView capture support")
+        } else {
+            print("⚠️  VideoProcessor: WebView capture unavailable, falling back to OverlayRenderer")
+        }
+    }
+
+    // MARK: - Overlay State Updates (called from ApiVideoLiveStream)
+
+    // Legacy API: Update overlay state (for OverlayRenderer fallback)
+    func updateSubGoal(current: Int, target: Int, visible: Bool) {
+        overlayRenderer?.updateSubGoalState(current: current, target: target, visible: visible)
+        overlayState.subGoalVisible = visible
+    }
+
+    func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
+        overlayRenderer?.updateFollowerGoalState(current: current, target: target, visible: visible)
+        overlayState.followerGoalVisible = visible
+    }
+
+    // NEW API: Update WebView textures (called from Flutter via method channel)
+    func updateWebViewTexture(kind: String, texture: MTLTexture, rect: CGRect, opacity: Float) {
+        switch kind {
+        case "chat":
+            chatTexture = texture
+            overlayState.chatRect = rect
+            overlayState.chatOpacity = opacity
+            overlayState.chatVisible = true
+            print("✅ VideoProcessor: Updated chat WebView texture (\(Int(rect.width))x\(Int(rect.height)))")
+
+        case "subGoal":
+            subGoalTexture = texture
+            overlayState.subGoalRect = rect
+            overlayState.subGoalOpacity = opacity
+            overlayState.subGoalVisible = true
+            print("✅ VideoProcessor: Updated subGoal WebView texture (\(Int(rect.width))x\(Int(rect.height)))")
+
+        case "followerGoal":
+            followerGoalTexture = texture
+            overlayState.followerGoalRect = rect
+            overlayState.followerGoalOpacity = opacity
+            overlayState.followerGoalVisible = true
+            print("✅ VideoProcessor: Updated followerGoal WebView texture (\(Int(rect.width))x\(Int(rect.height)))")
+
+        default:
+            print("⚠️  VideoProcessor: Unknown overlay kind: \(kind)")
+        }
+    }
+
+    // Clear specific overlay texture (called when overlay disabled)
+    func clearWebViewTexture(kind: String) {
+        switch kind {
+        case "chat":
+            chatTexture = nil
+            overlayState.chatVisible = false
+            webViewCaptureManager?.clearCache(for: kind)
+        case "subGoal":
+            subGoalTexture = nil
+            overlayState.subGoalVisible = false
+            webViewCaptureManager?.clearCache(for: kind)
+        case "followerGoal":
+            followerGoalTexture = nil
+            overlayState.followerGoalVisible = false
+            webViewCaptureManager?.clearCache(for: kind)
+        default:
+            break
+        }
+        print("🗑️  VideoProcessor: Cleared \(kind) WebView texture")
     }
 
     // MARK: - Buffer Pool Setup (Pre-warmed to prevent stalls)
@@ -150,6 +234,19 @@ class VideoProcessor {
         if outputPixelBufferPool == nil {
             setupPixelBufferPool(width: width, height: height)
             setupPipelines()
+        }
+
+        // WebView textures are provided via updateWebViewTexture() from Flutter
+        // No need to render overlays here - textures already captured by OverlayCaptureManager
+        // Fallback to OverlayRenderer only if WebView capture is unavailable
+        if webViewCaptureManager == nil, let renderer = overlayRenderer {
+            // Fallback: Use legacy CALayer rendering
+            if overlayState.subGoalVisible {
+                subGoalTexture = renderer.renderSubGoalTexture(width: 320, height: 80)
+            }
+            if overlayState.followerGoalVisible {
+                followerGoalTexture = renderer.renderFollowerGoalTexture(width: 320, height: 80)
+            }
         }
 
         var outputPixelBuffer: CVPixelBuffer?
@@ -276,3 +373,4 @@ class VideoProcessor {
         }
     }
 }
+#endif // !os(macOS)

@@ -13,14 +13,13 @@
  */
 
 import Foundation
-#if !os(macOS)
-import UIKit
-#endif
 import CoreGraphics
 import CoreText
 import Metal
 
 #if !os(macOS)
+import UIKit
+
 class OverlayRenderer {
     private let device: MTLDevice
     private let debounceInterval: TimeInterval = 0.033  // 30fps max overlay updates

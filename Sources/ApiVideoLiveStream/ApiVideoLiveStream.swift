@@ -649,6 +649,7 @@ public class ApiVideoLiveStream {
     #endif
 
     // MARK: - VideoProcessor Integration
+    #if !os(macOS)
     private var videoProcessor: VideoProcessor?
 
     public func enableOverlayCompositing() {
@@ -666,16 +667,15 @@ public class ApiVideoLiveStream {
     }
 
     public func updateSubGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
-        // videoProcessor?.updateSubGoal(current: current, target: target, visible: visible)
+        videoProcessor?.updateSubGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: SubGoal updated - \(current)/\(target) visible: \(visible)")
     }
 
     public func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
-        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
-        // videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
+        videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
     }
+    #endif // !os(macOS)
 
     public func updateOverlayTexture(
         kind: String,
