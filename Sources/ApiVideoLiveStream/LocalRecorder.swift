@@ -47,11 +47,6 @@ class LocalRecorder: NSObject {
         // Create asset writer
         let writer = try AVAssetWriter(outputURL: fileURL, fileType: .mp4)
 
-        // Video settings: Will be configured from first frame to match actual orientation
-        // Use nil settings initially - we'll configure from first CMSampleBuffer dimensions
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
-        videoInput.expectsMediaDataInRealTime = true
-
         // Audio settings: AAC 128kbps
         let audioSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -63,15 +58,7 @@ class LocalRecorder: NSObject {
         let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
         audioInput.expectsMediaDataInRealTime = true
 
-        // Add inputs to writer
-        if writer.canAdd(videoInput) {
-            writer.add(videoInput)
-            print("[LocalRecorder] ✅ Video input added")
-        } else {
-            print("[LocalRecorder] ❌ Cannot add video input")
-            throw NSError(domain: "LocalRecorder", code: 1, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input"])
-        }
-
+        // Add audio input immediately; video input is created once we know actual frame dimensions
         if writer.canAdd(audioInput) {
             writer.add(audioInput)
             print("[LocalRecorder] ✅ Audio input added")
@@ -80,15 +67,8 @@ class LocalRecorder: NSObject {
             throw NSError(domain: "LocalRecorder", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add audio input"])
         }
 
-        // Start writing
-        guard writer.startWriting() else {
-            let error = writer.error ?? NSError(domain: "LocalRecorder", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to start writing"])
-            print("[LocalRecorder] ❌ Failed to start writing: \(error.localizedDescription)")
-            throw error
-        }
-
         self.assetWriter = writer
-        self.videoInput = videoInput
+        self.videoInput = nil
         self.audioInput = audioInput
         self.outputURL = fileURL
         self.isRecording = true
@@ -96,21 +76,13 @@ class LocalRecorder: NSObject {
         self.videoSettingsConfigured = false
 
         print("[LocalRecorder] ✅ Recording started to: \(fileURL.path)")
-        print("[LocalRecorder] ⏳ Video dimensions will be set from first frame")
+        print("[LocalRecorder] ⏳ Video input will attach on first frame once dimensions are known")
     }
 
     /// Append video sample buffer
     func appendVideo(sampleBuffer: CMSampleBuffer) {
         guard isRecording,
-              let videoInput = videoInput,
               let writer = assetWriter else {
-            return
-        }
-
-        guard writer.status == .writing else {
-            if writer.status == .failed {
-                print("[LocalRecorder] ❌ Writer in failed state, error: \(writer.error?.localizedDescription ?? "unknown")")
-            }
             return
         }
 
@@ -128,6 +100,11 @@ class LocalRecorder: NSObject {
             print("[LocalRecorder] 📐 Detected video dimensions from first frame: \(width)x\(height)")
 
             // Create new video input with actual dimensions
+            /**
+             * PROBLEM: Placeholder video input was added during startRecording and later "removed" using a nonexistent API, causing build failure.
+             * ROOT CAUSE: AVAssetWriter doesn't support removing inputs, so trying to swap one out mid-stream is invalid.
+             * SOLUTION: Defer creating the video input until the first frame arrives, so the writer is configured correctly the first time.
+             */
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: width,
@@ -138,11 +115,9 @@ class LocalRecorder: NSObject {
                 ]
             ]
 
-            let newVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            let newVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings, sourceFormatHint: formatDescription)
             newVideoInput.expectsMediaDataInRealTime = true
 
-            // Replace the nil-settings input with properly configured one
-            writer.remove(videoInput)
             if writer.canAdd(newVideoInput) {
                 writer.add(newVideoInput)
                 self.videoInput = newVideoInput
@@ -152,6 +127,25 @@ class LocalRecorder: NSObject {
                 print("[LocalRecorder] ❌ Cannot add reconfigured video input")
                 return
             }
+        }
+
+        // Ensure writer is ready to accept media data
+        if writer.status == .unknown {
+            guard writer.startWriting() else {
+                let error = writer.error ?? NSError(domain: "LocalRecorder", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to start writing"])
+                print("[LocalRecorder] ❌ Failed to start writing: \(error.localizedDescription)")
+                return
+            }
+        } else if writer.status != .writing {
+            if writer.status == .failed {
+                print("[LocalRecorder] ❌ Writer in failed state, error: \(writer.error?.localizedDescription ?? "unknown")")
+            }
+            return
+        }
+
+        guard let videoInput = videoInput else {
+            print("[LocalRecorder] ❌ Video input missing after configuration")
+            return
         }
 
         // Start session on first video frame

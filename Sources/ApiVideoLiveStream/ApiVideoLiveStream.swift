@@ -677,19 +677,39 @@ public class ApiVideoLiveStream {
     }
     #endif // !os(macOS)
 
-    public func updateOverlayTexture(
+    /**
+     * PROBLEM: Flutter WebViews can't be snapshotted (platform views), so the stream missed overlay widgets.
+     * SOLUTION: Forward overlay layout + URL to native where hidden WKWebViews are captured into Metal textures.
+     */
+    public func configureOverlay(
         kind: String,
-        bytes: Data,
-        width: Int,
-        height: Int,
+        url: String?,
         left: CGFloat,
         top: CGFloat,
         overlayWidth: CGFloat,
-        overlayHeight: CGFloat
+        overlayHeight: CGFloat,
+        opacity: Float = 1.0
     ) {
-        // TODO: VideoProcessor needs to be made accessible to SDK (currently in Runner folder)
-        // For now, just log the call - actual Metal texture update will be implemented later
-        print("📊 ApiVideoLiveStream: updateOverlayTexture - kind: \(kind), size: \(width)x\(height), position: (\(left), \(top)), overlay size: \(overlayWidth)x\(overlayHeight), bytes: \(bytes.count)")
+        guard let processor = videoProcessor else {
+            print("⚠️ ApiVideoLiveStream: configureOverlay called without active VideoProcessor")
+            return
+        }
+
+        let normalizedRect = CGRect(x: left, y: top, width: overlayWidth, height: overlayHeight)
+        processor.configureOverlay(
+            kind: kind,
+            urlString: url,
+            rect: normalizedRect,
+            opacity: opacity
+        )
+    }
+
+    /**
+     * PROBLEM: Toggling overlays off in Flutter left stale textures in the encoder feed.
+     * SOLUTION: Flush the cached Metal texture so the compositor stops sampling it immediately.
+     */
+    public func clearOverlayTexture(kind: String) {
+        videoProcessor?.clearOverlayTexture(kind: kind)
     }
 }
 
