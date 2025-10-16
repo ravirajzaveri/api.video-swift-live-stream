@@ -43,6 +43,7 @@ public class MultiCameraController: NSObject {
     // Video settings
     private let videoQueue = DispatchQueue(label: "com.apivideo.multicam.video")
     private let audioQueue = DispatchQueue(label: "com.apivideo.multicam.audio")
+    private var videoMuted = false
 
     // MARK: - Public API
 
@@ -313,6 +314,15 @@ public class MultiCameraController: NSObject {
             connection.videoOrientation = orientation
         }
     }
+
+    /**
+     * PROBLEM: Screensaver toggle required keeping MultiCam session alive but hiding camera frames.
+     * ROOT CAUSE: MultiCam kept forwarding frames to the delegate even when the UI asked for the screensaver.
+     * SOLUTION: Allow ApiVideoLiveStream to mute video delivery without tearing down the whole session.
+     */
+    public func setVideoMuted(_ muted: Bool) {
+        videoMuted = muted
+    }
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -327,7 +337,9 @@ extension MultiCameraController: AVCaptureVideoDataOutputSampleBufferDelegate,
     ) {
         // Forward to delegate
         if output == videoDataOutput {
-            delegate?.multiCameraController(self, didOutputVideoSampleBuffer: sampleBuffer)
+            if !videoMuted {
+                delegate?.multiCameraController(self, didOutputVideoSampleBuffer: sampleBuffer)
+            }
         } else if output == audioDataOutput {
             delegate?.multiCameraController(self, didOutputAudioSampleBuffer: sampleBuffer)
         }

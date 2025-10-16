@@ -7,6 +7,9 @@ import Foundation
 import HaishinKit
 #if !os(macOS)
 import UIKit
+#if os(iOS)
+import WebKit
+#endif
 #endif
 import VideoToolbox
 
@@ -30,6 +33,17 @@ public class ApiVideoLiveStream {
 
     // Local recording
     private var localRecorder: LocalRecorder?
+
+    #if os(iOS)
+    // Screen saver
+    private var screenSaver: ScreenSaver?
+    private var screenSaverEnabled = false
+    private var screenSaverTimer: Timer?
+    private var shouldRestoreCameraAfterScreenSaver = false
+    #endif
+
+    private var lastFrameTime: CMTime = .zero
+    private var isStreaming = false
 
     #if os(iOS)
     private func currentVideoOrientation() -> AVCaptureVideoOrientation? {
@@ -537,6 +551,7 @@ public class ApiVideoLiveStream {
     /// Stop your livestream
     /// - Returns: Void
     public func stopStreaming() {
+        isStreaming = false
         let isConnected = self.rtmpConnection.connected
         self.rtmpConnection.close()
         if isConnected {
@@ -592,6 +607,138 @@ public class ApiVideoLiveStream {
         self.rtmpStream.attachAudio(nil)
     }
 
+    // MARK: - Screen Saver
+    /// Enable or disable screen saver mode
+    /// - Parameter enabled: True to show screensaver to viewers, false to show camera
+    public func setScreenSaver(enabled: Bool) {
+        NSLog("[ApiVideoLiveStream] setScreenSaver(\(enabled)) called")
+
+        screenSaverEnabled = enabled
+
+        if enabled {
+            /**
+             * PROBLEM: Toggle only showed a toast; viewers still saw camera because capture units never paused.
+             * ROOT CAUSE: Camera pipelines (HaishinKit + MultiCam) continued to push frames, so injected screensaver frames were overwritten immediately.
+             * SOLUTION: Pause physical camera delivery while the timer injects static frames, and remember whether to restore capture afterwards.
+             */
+            #if os(iOS)
+            if #available(iOS 13.0, *), useMultiCam, let multiCamController {
+                multiCamController.setVideoMuted(true)
+            } else {
+                shouldRestoreCameraAfterScreenSaver = rtmpStream.videoCapture(for: 0) != nil
+                if shouldRestoreCameraAfterScreenSaver {
+                    rtmpStream.attachCamera(nil)
+                }
+            }
+            #endif
+
+            let deviceOrientation = UIDevice.current.orientation
+            let deviceOrientationName: String
+            switch deviceOrientation {
+            case .portrait: deviceOrientationName = "portrait"
+            case .portraitUpsideDown: deviceOrientationName = "portraitUpsideDown"
+            case .landscapeLeft: deviceOrientationName = "landscapeLeft"
+            case .landscapeRight: deviceOrientationName = "landscapeRight"
+            case .faceUp: deviceOrientationName = "faceUp"
+            case .faceDown: deviceOrientationName = "faceDown"
+            default: deviceOrientationName = "unknown"
+            }
+
+            let videoSize = rtmpStream.videoSettings.videoSize
+            let width = Int(videoSize.width)
+            let height = Int(videoSize.height)
+
+            let currentVideoOrientationName: String
+            switch rtmpStream.videoOrientation {
+            case .portrait: currentVideoOrientationName = "portrait"
+            case .portraitUpsideDown: currentVideoOrientationName = "portraitUpsideDown"
+            case .landscapeLeft: currentVideoOrientationName = "landscapeLeft"
+            case .landscapeRight: currentVideoOrientationName = "landscapeRight"
+            @unknown default: currentVideoOrientationName = "unknown"
+            }
+
+            NSLog("[ApiVideoLiveStream] 🔍 PHYSICAL device orientation: \(deviceOrientationName)")
+            NSLog("[ApiVideoLiveStream] 🔍 VIDEO stream orientation: \(currentVideoOrientationName)")
+            NSLog("[ApiVideoLiveStream] 🔍 VIDEO stream dimensions: \(width)x\(height)")
+
+            let isLandscape = width > height
+            let imageName = isLandscape ? "SCREENSAVERLANDSCAPE" : "SCREENSAVERPORTRAIT"
+            NSLog("[ApiVideoLiveStream] 📸 Screensaver image selection: \(width)x\(height) → isLandscape=\(isLandscape) → imageName=\(imageName)")
+            NSLog("[ApiVideoLiveStream] ⚠️ MISMATCH CHECK: Physical=\(deviceOrientationName), VideoOrientation=\(currentVideoOrientationName), VideoDimensions=\(width)x\(height), SelectedImage=\(imageName)")
+
+            var imagePath: String? = nil
+            if UIImage(named: imageName) != nil {
+                NSLog("[ApiVideoLiveStream] Found screensaver in xcassets: \(imageName)")
+            }
+
+            if imagePath == nil {
+                if let bundlePath = Bundle.main.path(forResource: imageName, ofType: "jpg") {
+                    imagePath = bundlePath
+                    NSLog("[ApiVideoLiveStream] Found screensaver at: \(bundlePath)")
+                } else if let bundlePath = Bundle.main.path(forResource: imageName, ofType: "jpg", inDirectory: "Flutter/App.framework") {
+                    imagePath = bundlePath
+                    NSLog("[ApiVideoLiveStream] Found screensaver at: \(bundlePath)")
+                } else {
+                    NSLog("[ApiVideoLiveStream] ⚠️ Screensaver image not found in bundle, will use fallback")
+                }
+            }
+
+            screenSaver = ScreenSaver(width: width, height: height, imageName: imageName, imagePath: imagePath)
+            startScreenSaverFrameInjection()
+            NSLog("[ApiVideoLiveStream] ✅ Screen saver enabled (resolution: \(width)x\(height))")
+        } else {
+            stopScreenSaverFrameInjection()
+            // Drain in-flight frames before disabling screen saver to prevent crash
+            videoProcessor?.drainAndReset()
+            screenSaver = nil
+            NSLog("[ApiVideoLiveStream] ✅ Screen saver disabled")
+
+            if let currentOrientation = currentVideoOrientation() {
+                delegate?.orientationChanged(orientation: currentOrientation)
+            }
+
+            #if os(iOS)
+            if #available(iOS 13.0, *), useMultiCam, let multiCamController {
+                multiCamController.setVideoMuted(false)
+            } else if shouldRestoreCameraAfterScreenSaver {
+                shouldRestoreCameraAfterScreenSaver = false
+                if let camera = lastCamera {
+                    attachCamera(camera)
+                } else {
+                    attachCamera(AVCaptureDevice.Position.back)
+                }
+            }
+            #endif
+        }
+    }
+
+    private func startScreenSaverFrameInjection() {
+        stopScreenSaverFrameInjection()
+        screenSaverTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            self?.injectScreenSaverFrame()
+        }
+    }
+
+    private func stopScreenSaverFrameInjection() {
+        screenSaverTimer?.invalidate()
+        screenSaverTimer = nil
+    }
+
+    private func injectScreenSaverFrame() {
+        guard screenSaverEnabled,
+              isStreaming,
+              let screenSaver = screenSaver else {
+            return
+        }
+
+        let timestamp = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1000000000)
+
+        if let sampleBuffer = screenSaver.generateFrame(timestamp: timestamp) {
+            rtmpStream.append(sampleBuffer)
+            localRecorder?.appendVideo(sampleBuffer: sampleBuffer)
+        }
+    }
+
     @objc
     private func rtmpStatusHandler(_ notification: Notification) {
         let e = Event.from(notification)
@@ -607,13 +754,16 @@ public class ApiVideoLiveStream {
             self.rtmpStream.publish(self.streamKey)
 
         case RTMPStream.Code.publishStart.rawValue:
+            isStreaming = true
             self.delegate?.connectionSuccess()
 
         case RTMPConnection.Code.connectClosed.rawValue:
+            isStreaming = false
             self.delegate?.disconnection()
 
         default:
             if level == "error" {
+                isStreaming = false
                 self.delegate?.connectionFailed(code)
             }
         }
@@ -649,8 +799,10 @@ public class ApiVideoLiveStream {
     #endif
 
     // MARK: - VideoProcessor Integration
-    #if !os(macOS)
+    #if os(iOS)
     private var videoProcessor: VideoProcessor?
+    @available(iOS 14.0, *)
+    private var overlayManager: OverlayWidgetManager?
 
     public func enableOverlayCompositing() {
         guard let processor = VideoProcessor() else {
@@ -658,10 +810,24 @@ public class ApiVideoLiveStream {
             return
         }
         videoProcessor = processor
+        if #available(iOS 14.0, *) {
+            overlayManager = OverlayWidgetManager(
+                videoProcessor: processor,
+                videoSizeProvider: { [weak self] in
+                    self?.rtmpStream.videoSettings.videoSize ?? CGSize(width: 1280, height: 720)
+                }
+            )
+        } else {
+            print("⚠️ ApiVideoLiveStream: Overlay compositor requires iOS 14.0+ for snapshot capture")
+        }
         print("✅ ApiVideoLiveStream: Overlay compositing enabled")
     }
 
     public func disableOverlayCompositing() {
+        if #available(iOS 14.0, *) {
+            overlayManager?.clearAll()
+            overlayManager = nil
+        }
         videoProcessor = nil
         print("✅ ApiVideoLiveStream: Overlay compositing disabled")
     }
@@ -675,7 +841,7 @@ public class ApiVideoLiveStream {
         videoProcessor?.updateFollowerGoal(current: current, target: target, visible: visible)
         print("📊 ApiVideoLiveStream: FollowerGoal updated - \(current)/\(target) visible: \(visible)")
     }
-    #endif // !os(macOS)
+    #endif // os(iOS)
 
     /**
      * PROBLEM: Flutter WebViews can't be snapshotted (platform views), so the stream missed overlay widgets.
@@ -702,6 +868,22 @@ public class ApiVideoLiveStream {
             rect: normalizedRect,
             opacity: opacity
         )
+
+        #if os(iOS)
+        if #available(iOS 14.0, *) {
+            overlayManager?.configureOverlay(
+                kind: kind,
+                urlString: url,
+                layout: OverlayWidgetManager.Layout(
+                    left: left,
+                    top: top,
+                    width: overlayWidth,
+                    height: overlayHeight,
+                    opacity: CGFloat(opacity)
+                )
+            )
+        }
+        #endif
     }
 
     /**
@@ -710,6 +892,11 @@ public class ApiVideoLiveStream {
      */
     public func clearOverlayTexture(kind: String) {
         videoProcessor?.clearOverlayTexture(kind: kind)
+        #if os(iOS)
+        if #available(iOS 14.0, *) {
+            overlayManager?.clearOverlay(kind: kind)
+        }
+        #endif
     }
 }
 
@@ -728,6 +915,9 @@ public protocol ApiVideoLiveStreamDelegate: AnyObject {
 
     /// Called if an error happened during the video configuration
     func videoError(_ error: Error)
+
+    /// Called when device orientation changes (optional)
+    func orientationChanged(orientation: AVCaptureVideoOrientation)
 }
 
 extension AVCaptureVideoOrientation {
@@ -741,44 +931,402 @@ public enum LiveStreamError: Error {
     case IllegalOperationError(String)
 }
 
-// MARK: - MultiCameraControllerDelegate
 #if os(iOS)
+@available(iOS 14.0, *)
+private final class OverlayWidgetManager {
+    struct Layout {
+        var left: CGFloat
+        var top: CGFloat
+        var width: CGFloat
+        var height: CGFloat
+        var opacity: CGFloat
+    }
+
+    private final class Slot: NSObject, WKNavigationDelegate {
+        let kind: String
+        let webView: WKWebView
+        var layout: Layout
+        var currentURL: URL?
+        var captureTimer: Timer?
+        var isCapturing = false
+        var isContentLoaded = false
+
+        init(kind: String, layout: Layout) {
+            self.kind = kind
+            self.layout = layout
+
+            let configuration = WKWebViewConfiguration()
+            configuration.allowsInlineMediaPlayback = true
+            configuration.mediaTypesRequiringUserActionForPlayback = []
+            configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+            webView = WKWebView(frame: .zero, configuration: configuration)
+            webView.isOpaque = false
+            webView.isUserInteractionEnabled = false
+            webView.scrollView.isScrollEnabled = false
+            webView.backgroundColor = .clear
+            webView.scrollView.backgroundColor = .clear
+
+            super.init()
+
+            webView.navigationDelegate = self
+        }
+
+        func applyLayout(videoSize: CGSize) {
+            let width = max(videoSize.width * layout.width, 1)
+            let height = max(videoSize.height * layout.height, 1)
+            webView.frame = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+        }
+
+        func invalidate() {
+            captureTimer?.invalidate()
+            captureTimer = nil
+            isCapturing = false
+            isContentLoaded = false
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            isContentLoaded = true
+        }
+    }
+
+    private let videoProcessor: VideoProcessor
+    private let videoSizeProvider: () -> CGSize
+    private var slots: [String: Slot] = [:]
+    private let captureInterval: TimeInterval = 0.5 // ~2fps to balance CPU and responsiveness
+
+    init(videoProcessor: VideoProcessor, videoSizeProvider: @escaping () -> CGSize) {
+        self.videoProcessor = videoProcessor
+        self.videoSizeProvider = videoSizeProvider
+    }
+
+    func configureOverlay(kind: String, urlString: String?, layout: Layout) {
+        let normalized = normalize(layout: layout)
+        videoProcessor.updateOverlayLayout(kind: kind, rect: CGRect(x: normalized.left,
+                                                                    y: normalized.top,
+                                                                    width: normalized.width,
+                                                                    height: normalized.height),
+                                           opacity: normalized.opacity)
+
+        guard let urlString, let overlayURL = URL(string: urlString) else {
+            clearOverlay(kind: kind)
+            return
+        }
+
+        let rawSize = videoSizeProvider()
+        let videoSize: CGSize
+        if rawSize.width > 0 && rawSize.height > 0 {
+            videoSize = rawSize
+        } else {
+            videoSize = CGSize(width: 1280, height: 720)
+        }
+        let slot = slot(for: kind, layout: normalized, videoSize: videoSize)
+
+        if slot.currentURL != overlayURL {
+            slot.currentURL = overlayURL
+            slot.isContentLoaded = false
+            slot.webView.load(URLRequest(url: overlayURL))
+        }
+
+        startCapture(for: slot)
+    }
+
+    func clearOverlay(kind: String) {
+        if let slot = slots.removeValue(forKey: kind) {
+            slot.invalidate()
+        }
+        videoProcessor.clearOverlayTexture(kind: kind)
+    }
+
+    func clearAll() {
+        for (_, slot) in slots {
+            slot.invalidate()
+        }
+        slots.removeAll()
+        videoProcessor.clearAllOverlays()
+    }
+
+    // MARK: - Internal helpers
+
+    private func slot(for kind: String,
+                      layout: Layout,
+                      videoSize: CGSize) -> Slot {
+        if let existing = slots[kind] {
+            existing.layout = layout
+            existing.applyLayout(videoSize: videoSize)
+            return existing
+        }
+
+        let slot = Slot(kind: kind, layout: layout)
+        slot.applyLayout(videoSize: videoSize)
+        slots[kind] = slot
+        return slot
+    }
+
+    private func normalize(layout: Layout) -> Layout {
+        var left = max(0.0, min(layout.left, 1.0))
+        var top = max(0.0, min(layout.top, 1.0))
+        var width = max(0.0, min(layout.width, 1.0))
+        var height = max(0.0, min(layout.height, 1.0))
+
+        if left + width > 1.0 {
+            width = max(0.0, 1.0 - left)
+        }
+        if top + height > 1.0 {
+            height = max(0.0, 1.0 - top)
+        }
+
+        return Layout(left: left,
+                      top: top,
+                      width: width,
+                      height: height,
+                      opacity: max(0.0, min(layout.opacity, 1.0)))
+    }
+
+    private func startCapture(for slot: Slot) {
+        if slot.captureTimer == nil {
+            let timer = Timer.scheduledTimer(withTimeInterval: captureInterval, repeats: true) { [weak self, weak slot] _ in
+                guard let self, let slot else { return }
+                self.capture(slot: slot)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            slot.captureTimer = timer
+        }
+
+        capture(slot: slot)
+    }
+
+    private func capture(slot: Slot) {
+        if slot.webView.isLoading {
+            return
+        }
+
+        if !slot.isContentLoaded {
+            slot.isContentLoaded = true
+        }
+
+        guard !slot.isCapturing else { return }
+        slot.isCapturing = true
+
+        let config = WKSnapshotConfiguration()
+        config.rect = slot.webView.bounds
+        config.afterScreenUpdates = true
+
+        slot.webView.takeSnapshot(with: config) { [weak self, weak slot] image, error in
+            DispatchQueue.main.async {
+                guard let self, let slot else { return }
+                slot.isCapturing = false
+
+                if error != nil {
+                    return
+                }
+
+                guard let image else { return }
+                self.videoProcessor.updateOverlayImage(kind: slot.kind, image: image)
+            }
+        }
+    }
+}
+#endif
+
+#if os(iOS)
+/**
+ * PROBLEM: We referenced a ScreenSaver helper while compiling the SPM + Carthage frameworks, but SwiftPM ignores
+ *          unlisted source files when producing the release archive.
+ * ROOT CAUSE: The class lived in a standalone ScreenSaver.swift file that was never registered in the Swift package
+ *             target graph, so downstream builds saw the call sites but not the implementation.
+ * SOLUTION: Inline the helper as a file-scoped type so it ships automatically with both the library and framework products.
+ */
+fileprivate final class ScreenSaver {
+    private var screensaverImage: UIImage?
+    private var pixelBuffer: CVPixelBuffer?
+    private let width: Int
+    private let height: Int
+
+    init(width: Int, height: Int, imageName: String? = nil, imagePath: String? = nil) {
+        self.width = width
+        self.height = height
+
+        print("[ScreenSaver] Initializing with resolution: \(width)x\(height)")
+
+        if let imageName {
+            if let image = UIImage(named: imageName, in: Bundle.main, compatibleWith: nil) {
+                screensaverImage = image
+                print("[ScreenSaver] ✅ Loaded image from main bundle xcassets: \(imageName)")
+            } else if let image = UIImage(named: imageName) {
+                screensaverImage = image
+                print("[ScreenSaver] ✅ Loaded image from xcassets: \(imageName)")
+            } else {
+                print("[ScreenSaver] ⚠️ Image '\(imageName)' not found in xcassets")
+            }
+        }
+
+        if screensaverImage == nil, let imagePath, !imagePath.isEmpty {
+            if let image = UIImage(contentsOfFile: imagePath) {
+                screensaverImage = image
+                print("[ScreenSaver] ✅ Loaded image from file: \(imagePath)")
+            } else {
+                print("[ScreenSaver] ⚠️ Failed to load image from: \(imagePath)")
+            }
+        }
+
+        if screensaverImage == nil {
+            print("[ScreenSaver] Using programmatic fallback")
+            screensaverImage = createFallbackImage()
+        }
+
+        if let image = screensaverImage {
+            pixelBuffer = createPixelBuffer(from: image)
+        }
+    }
+
+    private func createFallbackImage() -> UIImage {
+        let size = CGSize(width: width, height: height)
+        let renderer = UIGraphicsImageRenderer(size: size)
+
+        return renderer.image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+
+            let text = "STREAM\nSTARTING\nSOON"
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.alignment = .center
+
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 48),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: paragraphStyle
+            ]
+
+            let textSize = text.size(withAttributes: attributes)
+            let textRect = CGRect(
+                x: (size.width - textSize.width) / 2,
+                y: (size.height - textSize.height) / 2,
+                width: textSize.width,
+                height: textSize.height
+            )
+
+            text.draw(in: textRect, withAttributes: attributes)
+        }
+    }
+
+    private func createPixelBuffer(from image: UIImage) -> CVPixelBuffer? {
+        let resizedImage = resizeImage(image, to: CGSize(width: width, height: height))
+
+        let attrs = [
+            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue
+        ] as CFDictionary
+
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32ARGB,
+            attrs,
+            &pixelBuffer
+        )
+
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+            print("[ScreenSaver] ❌ Failed to create pixel buffer")
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let pixelData = CVPixelBufferGetBaseAddress(buffer) else {
+            print("[ScreenSaver] ❌ Pixel buffer base address unavailable")
+            return nil
+        }
+
+        let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+
+        guard let context = CGContext(
+            data: pixelData,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: rgbColorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        ) else {
+            print("[ScreenSaver] ❌ Failed to create CGContext")
+            return nil
+        }
+
+        if let cgImage = resizedImage.cgImage {
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            print("[ScreenSaver] ✅ Created pixel buffer from image")
+        }
+
+        return buffer
+    }
+
+    private func resizeImage(_ image: UIImage, to size: CGSize) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+    }
+
+    func generateFrame(timestamp: CMTime) -> CMSampleBuffer? {
+        guard let pixelBuffer else {
+            print("[ScreenSaver] ❌ No pixel buffer available")
+            return nil
+        }
+
+        var timingInfo = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: timestamp,
+            decodeTimeStamp: .invalid
+        )
+
+        var formatDescription: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription
+        )
+
+        guard status == noErr, let format = formatDescription else {
+            print("[ScreenSaver] ❌ Failed to create format description")
+            return nil
+        }
+
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: format,
+            sampleTiming: &timingInfo,
+            sampleBufferOut: &sampleBuffer
+        )
+
+        guard sampleStatus == noErr else {
+            print("[ScreenSaver] ❌ Failed to create sample buffer: \(sampleStatus)")
+            return nil
+        }
+
+        return sampleBuffer
+    }
+}
+
+// MARK: - MultiCameraControllerDelegate
 @available(iOS 13.0, *)
 extension ApiVideoLiveStream: MultiCameraControllerDelegate {
     public func multiCameraController(_ controller: MultiCameraController,
                                       didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
         var finalSampleBuffer = sampleBuffer
 
-        // Apply overlay compositing if enabled
         if let processor = videoProcessor,
-           let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-           let processedBuffer = processor.process(pixelBuffer: imageBuffer) {
-            // Create new CMSampleBuffer with processed pixel buffer
-            // Reuse original timing info for A/V sync
-            var newSampleBuffer: CMSampleBuffer?
-            var timingInfo = CMSampleTimingInfo()
-            CMSampleBufferGetSampleTimingInfo(sampleBuffer, at: 0, timingInfoOut: &timingInfo)
+           let composited = processor.process(sampleBuffer: sampleBuffer) {
+            finalSampleBuffer = composited
+        }
 
-            var formatDescription: CMFormatDescription?
-            CMVideoFormatDescriptionCreateForImageBuffer(
-                allocator: kCFAllocatorDefault,
-                imageBuffer: processedBuffer,
-                formatDescriptionOut: &formatDescription
-            )
-
-            if let formatDescription = formatDescription {
-                CMSampleBufferCreateReadyWithImageBuffer(
-                    allocator: kCFAllocatorDefault,
-                    imageBuffer: processedBuffer,
-                    formatDescription: formatDescription,
-                    sampleTiming: &timingInfo,
-                    sampleBufferOut: &newSampleBuffer
-                )
-
-                if let newSampleBuffer = newSampleBuffer {
-                    finalSampleBuffer = newSampleBuffer
-                }
-            }
+        if screenSaverEnabled {
+            return
         }
 
         // HaishinKit 1.7.3: IOStream.append() auto-detects media type

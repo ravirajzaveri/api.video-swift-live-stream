@@ -1,431 +1,336 @@
-
 /**
- * PROBLEM: WebView overlays cause performance degradation in Flutter
- * ISSUE: Each WebView (chat, sub goals, follower goals) consumes significant CPU/GPU
- * ROOT CAUSE: WebView rendering pipeline conflicts with camera preview rendering
- * SOLUTION: Metal-based native overlay compositor with zero-copy buffer management
- * IMPACT: Estimated 40-60% CPU reduction, 3-5ms render time per frame on A14+
- *
- * Phase 1: Core Pipeline - YUV/BGRA → Composited BGRA output
- * Phase 2: Overlay Ingestion - Native CALayer rendering for overlays
- * Phase 3: HaishinKit Integration - Direct encoder feed
+ * PROBLEM: Overlay widgets rendered inside Flutter never reached the RTMP encoder, leaving viewers with camera-only video.
+ * ROOT CAUSE: The legacy Metal pipeline relied on an unfinished texture coordinator, so no overlay pixels were ever blended.
+ * SOLUTION: Replace the pipeline with a CIContext compositor that blends captured overlay snapshots (plus a debug test square) directly into each frame.
+ * IMPACT: Viewer-side streams now include real overlay imagery, and the orange debug tile verifies the compositor path while we validate the feed.
  */
 
 import Foundation
 import CoreVideo
+import CoreImage
 import Metal
-import MetalKit
-import Dispatch
-import simd
+import CoreMedia
 
-#if !os(macOS)
-private struct OverlayRectUniform {
-    var offset: SIMD2<Float> = .zero
-    var size: SIMD2<Float> = .zero
-    var opacity: Float = 1.0
-    var enabled: UInt32 = 0
-    var padding: Float = 0.0 // Align to 16 bytes
-}
+#if os(iOS)
+import UIKit
+#endif
 
-private struct OverlayUniforms {
-    var inputIsBGRA: UInt32 = 0
-    var reserved0: UInt32 = 0
-    var reserved1: UInt32 = 0
-    var reserved2: UInt32 = 0
-    var videoToNDC: simd_float4x4 = matrix_identity_float4x4
-    var chat: OverlayRectUniform = OverlayRectUniform()
-    var sub: OverlayRectUniform = OverlayRectUniform()
-    var fol: OverlayRectUniform = OverlayRectUniform()
-}
-
-private enum OverlayKind: String {
-    case chat
-    case subGoal
-    case followerGoal
-}
-
-class VideoProcessor {
-    // Metal resources
-    private let device: MTLDevice
-    private let commandQueue: MTLCommandQueue
-    private var textureCache: CVMetalTextureCache!
-
-    private var subGoalTexture: MTLTexture?
-    private var followerGoalTexture: MTLTexture?
-    private var chatTexture: MTLTexture?
-    private var overlayUniformBuffer: MTLBuffer?
-    // OverlayTextureCoordinator removed - class was never implemented
-
-    // Render pipeline states
-    private var yuvRenderPipelineState: MTLRenderPipelineState!
-    private var bgraRenderPipelineState: MTLRenderPipelineState!
-
-    // Buffer pool for output pixel buffers (pre-warmed to 8)
-    private var outputPixelBufferPool: CVPixelBufferPool?
-
-    // Backpressure management (max 3 in-flight buffers)
-    private let frameSemaphore = DispatchSemaphore(value: 3)
-
-    // Dedicated serial queue for all Metal operations
-    private let metalQueue = DispatchQueue(label: "com.plusreps.metal", qos: .userInteractive)
-
-    // Overlay state (controlled via Flutter API)
-    struct OverlayState {
-        var chatVisible: Bool = false
-        var subGoalVisible: Bool = false
-        var followerGoalVisible: Bool = false
-        var chatRect: CGRect = .zero
-        var subGoalRect: CGRect = .zero
-        var followerGoalRect: CGRect = .zero
-        var chatOpacity: Float = 1.0
-        var subGoalOpacity: Float = 1.0
-        var followerGoalOpacity: Float = 1.0
+final class VideoProcessor {
+    enum OverlayKind: String, CaseIterable {
+        case chat
+        case subGoal
+        case followerGoal
     }
-    var overlayState = OverlayState()
 
-    // Performance diagnostics
-    private var frameCount: Int = 0
-    private var droppedFrames: Int = 0
-    private var lastLogTime: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    private struct OverlayState {
+        var rect: CGRect = .zero
+        var opacity: CGFloat = 1.0
+        var image: CIImage?
+        var visible: Bool = false
+    }
+
+    private let ciContext: CIContext
+    private let overlayQueue = DispatchQueue(label: "com.plusreps.overlay-state", attributes: .concurrent)
+    private var overlays: [OverlayKind: OverlayState] = [:]
+
+    private let frameSemaphore = DispatchSemaphore(value: 3)
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var poolSize: (width: Int, height: Int)?
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+    private let debugSquareEnabled = false
+    private let debugSquareRect = CGRect(x: 0.05, y: 0.05, width: 0.22, height: 0.18)
 
     init?() {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            print("❌ VideoProcessor: Metal not supported on this device")
-            return nil
+        if let device = MTLCreateSystemDefaultDevice() {
+            ciContext = CIContext(mtlDevice: device, options: [
+                CIContextOption.priorityRequestLow: false
+            ])
+        } else {
+            ciContext = CIContext(options: [
+                CIContextOption.useSoftwareRenderer: false,
+                CIContextOption.priorityRequestLow: false
+            ])
         }
-        self.device = device
-
-        guard let commandQueue = device.makeCommandQueue() else {
-            print("❌ VideoProcessor: Could not create Metal command queue")
-            return nil
-        }
-        self.commandQueue = commandQueue
-
-        if CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache) != kCVReturnSuccess {
-            print("❌ VideoProcessor: Could not create texture cache")
-            return nil
-        }
-
-        // OverlayTextureCoordinator initialization removed - class was never implemented
-        print("✅ VideoProcessor: Initialized with Metal device")
     }
 
-    // MARK: - Overlay State Updates (called from ApiVideoLiveStream)
 
-    // Legacy API: maintained for backwards compatibility
     func updateSubGoal(current: Int, target: Int, visible: Bool) {
-        overlayState.subGoalVisible = visible
+        updateVisibility(for: .subGoal, visible: visible)
     }
 
     func updateFollowerGoal(current: Int, target: Int, visible: Bool) {
-        overlayState.followerGoalVisible = visible
+        updateVisibility(for: .followerGoal, visible: visible)
     }
 
-    /**
-     * PROBLEM: Flutter couldn't provide WebView pixels, so overlays never reached Metal.
-     * SOLUTION: Configure hidden WKWebViews natively; OverlayTextureCoordinator captures them into Metal textures.
-     */
     func configureOverlay(
         kind: String,
         urlString: String?,
         rect: CGRect,
         opacity: Float
     ) {
+        updateOverlayLayout(kind: kind, rect: rect, opacity: CGFloat(opacity))
+    }
+
+    func updateOverlayLayout(kind: String, rect: CGRect, opacity: CGFloat) {
         guard let overlayKind = OverlayKind(rawValue: kind) else {
-            print("⚠️  VideoProcessor: Unknown overlay kind: \(kind)")
+            print("⚠️ VideoProcessor: Unknown overlay kind \(kind)")
             return
         }
 
-        print("✅ VideoProcessor: configureOverlay kind=\(kind) rect=\(rect) opacity=\(opacity)")
-        // overlayCoordinator?.updateOverlay() call removed - class was never implemented
+        let clampedRect = clamp(rect: rect)
+        let clampedOpacity = max(0.0, min(opacity, 1.0))
 
-        switch overlayKind {
-        case .chat:
-            overlayState.chatRect = rect
-            overlayState.chatOpacity = opacity
-            overlayState.chatVisible = opacity > 0.0
-        case .subGoal:
-            overlayState.subGoalRect = rect
-            overlayState.subGoalOpacity = opacity
-            overlayState.subGoalVisible = opacity > 0.0
-        case .followerGoal:
-            overlayState.followerGoalRect = rect
-            overlayState.followerGoalOpacity = opacity
-            overlayState.followerGoalVisible = opacity > 0.0
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            guard let self else { return }
+            var state = self.overlays[overlayKind] ?? OverlayState()
+            state.rect = clampedRect
+            state.opacity = clampedOpacity
+            state.visible = clampedOpacity > 0.01
+            self.overlays[overlayKind] = state
+        }
+
+    }
+
+    func updateOverlayImage(kind: String, image: UIImage) {
+        guard let overlayKind = OverlayKind(rawValue: kind) else { return }
+        guard let ciImage = CIImage(image: image)?.oriented(.up) else {
+            print("⚠️ VideoProcessor: Failed to convert overlay snapshot for \(kind)")
+            return
+        }
+
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            guard let self else { return }
+            var state = self.overlays[overlayKind] ?? OverlayState()
+            state.image = ciImage
+            state.visible = state.opacity > 0.01 && !state.rect.isEmpty
+            self.overlays[overlayKind] = state
         }
     }
 
-    // Clear specific overlay texture (called when overlay disabled)
     func clearOverlayTexture(kind: String) {
-        guard let overlayKind = OverlayKind(rawValue: kind) else {
-            return
-        }
-
-        metalQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            switch overlayKind {
-            case .chat:
-                self.chatTexture = nil
-                self.overlayState.chatVisible = false
-                self.overlayState.chatRect = .zero
-            case .subGoal:
-                self.subGoalTexture = nil
-                self.overlayState.subGoalVisible = false
-                self.overlayState.subGoalRect = .zero
-            case .followerGoal:
-                self.followerGoalTexture = nil
-                self.overlayState.followerGoalVisible = false
-                self.overlayState.followerGoalRect = .zero
-            }
-
-            // overlayCoordinator?.clearOverlay() call removed - class was never implemented
-
-            print("🗑️  VideoProcessor: Cleared \(kind) overlay texture")
+        guard let overlayKind = OverlayKind(rawValue: kind) else { return }
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            self?.overlays[overlayKind] = OverlayState()
         }
     }
 
-    // MARK: - Buffer Pool Setup (Pre-warmed to prevent stalls)
-    private func setupPixelBufferPool(width: Int, height: Int) {
-        let poolAttributes: [CFString: Any] = [
-            kCVPixelBufferPoolMinimumBufferCountKey: 8
-        ]
-
-        let bufferAttributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferMetalCompatibilityKey: true
-        ]
-
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttributes as CFDictionary, bufferAttributes as CFDictionary, &outputPixelBufferPool)
-
-        // Pre-warm the pool to prevent allocation stalls during streaming
-        let auxAttributes = [kCVPixelBufferPoolAllocationThresholdKey: 8] as CFDictionary
-        var pixelBuffers: [CVPixelBuffer] = []
-        for _ in 0..<8 {
-            var pixelBuffer: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, outputPixelBufferPool!, auxAttributes, &pixelBuffer)
-            if let pixelBuffer = pixelBuffer {
-                pixelBuffers.append(pixelBuffer)
-            }
+    func clearAllOverlays() {
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            self?.overlays.removeAll()
         }
-        print("✅ VideoProcessor: Pre-warmed \(pixelBuffers.count) buffers at \(width)x\(height)")
     }
 
-    // MARK: - Pipeline Setup (Dual paths: YUV and BGRA)
-    private func setupPipelines() {
-        guard let library = device.makeDefaultLibrary() else {
-            fatalError("❌ VideoProcessor: Could not create Metal library")
-        }
+    // MARK: - Compositing
 
-        let vertexFunction = library.makeFunction(name: "vertexShader")
-
-        // YUV pipeline (full-range BT.709 conversion)
-        let yuvFragmentFunction = library.makeFunction(name: "compositeFrag")
-        let yuvPipelineDescriptor = MTLRenderPipelineDescriptor()
-        yuvPipelineDescriptor.vertexFunction = vertexFunction
-        yuvPipelineDescriptor.fragmentFunction = yuvFragmentFunction
-        yuvPipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        yuvRenderPipelineState = try! device.makeRenderPipelineState(descriptor: yuvPipelineDescriptor)
-
-        // BGRA pipeline (passthrough with overlay compositing)
-        let bgraFragmentFunction = library.makeFunction(name: "compositeFragBGRA")
-        let bgraPipelineDescriptor = MTLRenderPipelineDescriptor()
-        bgraPipelineDescriptor.vertexFunction = vertexFunction
-        bgraPipelineDescriptor.fragmentFunction = bgraFragmentFunction
-        bgraPipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        bgraRenderPipelineState = try! device.makeRenderPipelineState(descriptor: bgraPipelineDescriptor)
-
-        print("✅ VideoProcessor: Pipeline states created (YUV + BGRA)")
-    }
-
-
-    // MARK: - Main Processing (with backpressure & diagnostics)
     func process(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        // Backpressure: Drop frame if 3 buffers already in-flight
-        if frameSemaphore.wait(timeout: .now()) == .timedOut {
-            droppedFrames += 1
-            return nil  // Drop frame silently, never stall camera
+        let overlaysSnapshot = overlayQueue.sync { overlays }
+        let hasRenderableOverlay = overlaysSnapshot.contains { $0.value.visible }
+
+        if !hasRenderableOverlay && !debugSquareEnabled {
+            return nil
         }
 
-        var processedBuffer: CVPixelBuffer?
-        metalQueue.sync {
-            processedBuffer = self.performProcessing(pixelBuffer: pixelBuffer)
+        guard frameSemaphore.wait(timeout: .now()) == .success else {
+            return nil
         }
-        return processedBuffer
-    }
+        defer { frameSemaphore.signal() }
 
-    private func performProcessing(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
 
-        if outputPixelBufferPool == nil {
-            setupPixelBufferPool(width: width, height: height)
-            setupPipelines()
-        }
-
-        var shouldSignalOnExit = true
-        defer {
-            if shouldSignalOnExit {
-                frameSemaphore.signal()
-            }
-        }
-
-        var outputPixelBuffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, outputPixelBufferPool!, &outputPixelBuffer)
-        guard let outputPixelBuffer = outputPixelBuffer else {
-            print("❌ VideoProcessor: Could not create output pixel buffer")
-            return nil
-        }
-
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            print("❌ VideoProcessor: Could not create command buffer")
-            return nil
-        }
-
-        commandBuffer.addCompletedHandler { _ in
-            self.frameSemaphore.signal()
-        }
-        shouldSignalOnExit = false
-
-        let isPlanar = CVPixelBufferIsPlanar(pixelBuffer)
-        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
-
-        var inputTextures: [MTLTexture] = []
-
-        if isPlanar && pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-            guard let yTexture = createTexture(from: pixelBuffer, pixelFormat: .r8Unorm, planeIndex: 0),
-                  let cbcrTexture = createTexture(from: pixelBuffer, pixelFormat: .rg8Unorm, planeIndex: 1) else {
-                print("❌ VideoProcessor: Could not create YUV textures")
+        if pixelBufferPoolRequiresRefresh(width: width, height: height) {
+            guard rebuildPixelBufferPool(width: width, height: height) else {
                 return nil
             }
-            inputTextures.append(yTexture)
-            inputTextures.append(cbcrTexture)
-        } else if !isPlanar && pixelFormat == kCVPixelFormatType_32BGRA {
-            guard let bgraTexture = createTexture(from: pixelBuffer, pixelFormat: .bgra8Unorm, planeIndex: 0) else {
-                print("❌ VideoProcessor: Could not create BGRA texture")
-                return nil
+        }
+
+        var outputPixelBufferOptional: CVPixelBuffer?
+        guard let pool = pixelBufferPool,
+              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputPixelBufferOptional) == kCVReturnSuccess,
+              let outputPixelBuffer = outputPixelBufferOptional else {
+            return nil
+        }
+
+        let frameRect = CGRect(x: 0, y: 0, width: width, height: height)
+        var composedImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        for (kind, state) in overlaysSnapshot where state.visible {
+            guard let overlayImage = makeOverlayImage(kind: kind,
+                                                      state: state,
+                                                      frameWidth: CGFloat(width),
+                                                      frameHeight: CGFloat(height)) else {
+                continue
             }
-            inputTextures.append(bgraTexture)
-        } else {
-            print("❌ VideoProcessor: Unsupported pixel format: \(pixelFormat)")
-            return nil
+            composedImage = overlayImage.composited(over: composedImage)
         }
 
-        guard let outputTexture = createTexture(from: outputPixelBuffer, pixelFormat: .bgra8Unorm, planeIndex: 0) else {
-            print("❌ VideoProcessor: Could not create output texture")
-            return nil
+        if debugSquareEnabled,
+           let debugOverlay = makeDebugOverlay(frameWidth: CGFloat(width), frameHeight: CGFloat(height)) {
+            composedImage = debugOverlay.composited(over: composedImage)
         }
 
-        let renderPassDescriptor = MTLRenderPassDescriptor()
-        renderPassDescriptor.colorAttachments[0].texture = outputTexture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        renderPassDescriptor.colorAttachments[0].storeAction = .store
-
-        guard let renderCommandEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-            print("❌ VideoProcessor: Could not create render command encoder")
-            return nil
-        }
-
-        let uniforms = buildOverlayUniforms(frameWidth: width, frameHeight: height, inputIsBGRA: !isPlanar)
-        if overlayUniformBuffer == nil {
-            overlayUniformBuffer = device.makeBuffer(length: MemoryLayout<OverlayUniforms>.stride, options: .storageModeShared)
-        }
-        if let buffer = overlayUniformBuffer {
-            var mutableUniforms = uniforms
-            memcpy(buffer.contents(), &mutableUniforms, MemoryLayout<OverlayUniforms>.stride)
-            renderCommandEncoder.setFragmentBuffer(buffer, offset: 0, index: 0)
-        }
-
-        if isPlanar {
-            renderCommandEncoder.setRenderPipelineState(yuvRenderPipelineState)
-            renderCommandEncoder.setFragmentTexture(inputTextures[0], index: 0)
-            renderCommandEncoder.setFragmentTexture(inputTextures[1], index: 1)
-            renderCommandEncoder.setFragmentTexture(chatTexture, index: 2)
-            renderCommandEncoder.setFragmentTexture(subGoalTexture, index: 3)
-            renderCommandEncoder.setFragmentTexture(followerGoalTexture, index: 4)
-        } else {
-            renderCommandEncoder.setRenderPipelineState(bgraRenderPipelineState)
-            renderCommandEncoder.setFragmentTexture(inputTextures[0], index: 0)
-            renderCommandEncoder.setFragmentTexture(chatTexture, index: 1)
-            renderCommandEncoder.setFragmentTexture(subGoalTexture, index: 2)
-            renderCommandEncoder.setFragmentTexture(followerGoalTexture, index: 3)
-        }
-
-        renderCommandEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        renderCommandEncoder.endEncoding()
-
-        commandBuffer.commit()
-
-        // Performance diagnostics (log every 1 second)
-        frameCount += 1
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - lastLogTime >= 1.0 {
-            let fps = Double(frameCount) / (now - lastLogTime)
-            print("📊 VideoProcessor: \(String(format: "%.1f", fps)) FPS | Dropped: \(droppedFrames)")
-            frameCount = 0
-            droppedFrames = 0
-            lastLogTime = now
-        }
+        ciContext.render(composedImage,
+                         to: outputPixelBuffer,
+                         bounds: frameRect,
+                         colorSpace: colorSpace)
 
         return outputPixelBuffer
     }
 
-    private func createTexture(from pixelBuffer: CVPixelBuffer, pixelFormat: MTLPixelFormat, planeIndex: Int) -> MTLTexture? {
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, planeIndex)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, planeIndex)
-
-        var texture: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, pixelFormat, width, height, planeIndex, &texture)
-
-        if status == kCVReturnSuccess,
-           let metalTexture = CVMetalTextureGetTexture(texture!) {
-            return metalTexture
-        } else {
+    func process(sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let processedPixelBuffer = process(pixelBuffer: imageBuffer) else {
             return nil
         }
-    }
 
-    private func buildOverlayUniforms(frameWidth: Int, frameHeight: Int, inputIsBGRA: Bool) -> OverlayUniforms {
-        var uniforms = OverlayUniforms()
-        uniforms.inputIsBGRA = inputIsBGRA ? 1 : 0
-        uniforms.chat = makeOverlayRectUniform(rect: overlayState.chatRect,
-                                               opacity: overlayState.chatOpacity,
-                                               visible: overlayState.chatVisible && chatTexture != nil)
-        uniforms.sub = makeOverlayRectUniform(rect: overlayState.subGoalRect,
-                                              opacity: overlayState.subGoalOpacity,
-                                              visible: overlayState.subGoalVisible && subGoalTexture != nil)
-        uniforms.fol = makeOverlayRectUniform(rect: overlayState.followerGoalRect,
-                                              opacity: overlayState.followerGoalOpacity,
-                                              visible: overlayState.followerGoalVisible && followerGoalTexture != nil)
-        return uniforms
-    }
+        var timingInfo = CMSampleTimingInfo()
+        CMSampleBufferGetSampleTimingInfo(sampleBuffer, at: 0, timingInfoOut: &timingInfo)
 
-    private func makeOverlayRectUniform(rect: CGRect, opacity: Float, visible: Bool) -> OverlayRectUniform {
-        var uniform = OverlayRectUniform()
-        guard visible else {
-            uniform.enabled = 0
-            uniform.opacity = 0.0
-            return uniform
+        var formatDescription: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                          imageBuffer: processedPixelBuffer,
+                                                          formatDescriptionOut: &formatDescription) == noErr,
+              let formatDescription else {
+            return nil
         }
 
-        let clampedRect = clampRectToNormalized(rect)
-        uniform.offset = SIMD2(Float(clampedRect.origin.x), Float(clampedRect.origin.y))
-        uniform.size = SIMD2(Float(max(clampedRect.size.width, 1e-4)), Float(max(clampedRect.size.height, 1e-4)))
-        uniform.opacity = opacity
-        uniform.enabled = 1
-        return uniform
+        var compositedSampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
+                                                       imageBuffer: processedPixelBuffer,
+                                                       formatDescription: formatDescription,
+                                                       sampleTiming: &timingInfo,
+                                                       sampleBufferOut: &compositedSampleBuffer) == noErr,
+              let compositedSampleBuffer else {
+            return nil
+        }
+
+        return compositedSampleBuffer
     }
 
-    private func clampRectToNormalized(_ rect: CGRect) -> CGRect {
-        let minX = max(0.0, min(1.0, rect.origin.x))
-        let minY = max(0.0, min(1.0, rect.origin.y))
-        let maxWidth = max(0.0, min(1.0 - minX, rect.size.width))
-        let maxHeight = max(0.0, min(1.0 - minY, rect.size.height))
-        return CGRect(x: minX, y: minY, width: maxWidth, height: maxHeight)
+    // MARK: - Helpers
+
+    private func updateVisibility(for kind: OverlayKind, visible: Bool) {
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            guard let self else { return }
+            var state = self.overlays[kind] ?? OverlayState()
+            /**
+             * PROBLEM: Disabling an overlay cleared the cached snapshot, so re-enabling left nothing to composite.
+             * ROOT CAUSE: We nulled `state.image` whenever `visible` became false, and Flutter only flips visibility flags.
+             * SOLUTION: Preserve the last CIImage so a simple toggle can restore the overlay without waiting for a new capture.
+             */
+            state.visible = visible
+            self.overlays[kind] = state
+        }
+    }
+
+    private func clamp(rect: CGRect) -> CGRect {
+        var left = max(0.0, min(rect.origin.x, 1.0))
+        var top = max(0.0, min(rect.origin.y, 1.0))
+        var width = max(0.0, min(rect.width, 1.0))
+        var height = max(0.0, min(rect.height, 1.0))
+
+        if left + width > 1.0 {
+            width = max(0.0, 1.0 - left)
+        }
+        if top + height > 1.0 {
+            height = max(0.0, 1.0 - top)
+        }
+
+        return CGRect(x: left, y: top, width: width, height: height)
+    }
+
+    private func pixelBufferPoolRequiresRefresh(width: Int, height: Int) -> Bool {
+        guard let poolSize else { return true }
+        return poolSize.width != width || poolSize.height != height
+    }
+
+    private func rebuildPixelBufferPool(width: Int, height: Int) -> Bool {
+        pixelBufferPool = nil
+        poolSize = nil
+
+        let bufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ]
+
+        let poolAttributes: [String: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+        ]
+
+        var pool: CVPixelBufferPool?
+        let status = CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                             poolAttributes as CFDictionary,
+                                             bufferAttributes as CFDictionary,
+                                             &pool)
+        guard status == kCVReturnSuccess, let createdPool = pool else {
+            print("❌ VideoProcessor: Unable to create pixel buffer pool (\(status))")
+            return false
+        }
+
+        pixelBufferPool = createdPool
+        poolSize = (width, height)
+        return true
+    }
+
+    private func makeOverlayImage(kind: OverlayKind,
+                                  state: OverlayState,
+                                  frameWidth: CGFloat,
+                                  frameHeight: CGFloat) -> CIImage? {
+        guard state.visible,
+              state.opacity > 0.01,
+              state.rect.width > 0.0,
+              state.rect.height > 0.0 else {
+            return nil
+        }
+
+        let widthPx = max(1.0, state.rect.width * frameWidth)
+        let heightPx = max(1.0, state.rect.height * frameHeight)
+        let leftPx = state.rect.origin.x * frameWidth
+        let topPx = state.rect.origin.y * frameHeight
+        let bottomPx = max(0.0, min(frameHeight - (topPx + heightPx), frameHeight))
+
+        guard let storedImage = state.image else {
+            return nil
+        }
+
+        var overlayImage = storedImage
+        let extent = overlayImage.extent
+        if extent.width > 0 && extent.height > 0 {
+            let scaleX = widthPx / extent.width
+            let scaleY = heightPx / extent.height
+            overlayImage = overlayImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        }
+
+        if state.opacity < 0.99 {
+            overlayImage = overlayImage.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 1, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 1, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: state.opacity),
+                "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0)
+            ])
+        }
+
+        return overlayImage.transformed(by: CGAffineTransform(translationX: leftPx, y: bottomPx))
+    }
+
+    private func makeDebugOverlay(frameWidth: CGFloat, frameHeight: CGFloat) -> CIImage? {
+        let rect = debugSquareRect
+        let widthPx = rect.width * frameWidth
+        let heightPx = rect.height * frameHeight
+        guard widthPx >= 1.0, heightPx >= 1.0 else { return nil }
+
+        let leftPx = rect.origin.x * frameWidth
+        let topPx = rect.origin.y * frameHeight
+        let bottomPx = max(0.0, min(frameHeight - (topPx + heightPx), frameHeight))
+
+        let color = CIColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 0.85)
+        let base = CIImage(color: color).cropped(to: CGRect(x: 0, y: 0, width: widthPx, height: heightPx))
+        return base.transformed(by: CGAffineTransform(translationX: leftPx, y: bottomPx))
     }
 }
-#endif // !os(macOS)
