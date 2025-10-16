@@ -13,6 +13,8 @@ import CoreMedia
 
 #if os(iOS)
 import UIKit
+#else
+import AppKit
 #endif
 
 final class VideoProcessor {
@@ -92,6 +94,7 @@ final class VideoProcessor {
 
     }
 
+    #if os(iOS)
     func updateOverlayImage(kind: String, image: UIImage) {
         guard let overlayKind = OverlayKind(rawValue: kind) else { return }
         guard let ciImage = CIImage(image: image)?.oriented(.up) else {
@@ -107,6 +110,7 @@ final class VideoProcessor {
             self.overlays[overlayKind] = state
         }
     }
+    #endif
 
     func clearOverlayTexture(kind: String) {
         guard let overlayKind = OverlayKind(rawValue: kind) else { return }
@@ -119,6 +123,20 @@ final class VideoProcessor {
         overlayQueue.async(flags: .barrier) { [weak self] in
             self?.overlays.removeAll()
         }
+    }
+
+    /// Drain in-flight frames and reset state
+    /// Call before disabling screen saver or stopping stream
+    func drainAndReset() {
+        // Clear the overlay state completely
+        overlayQueue.async(flags: .barrier) { [weak self] in
+            guard let self else { return }
+            self.overlays.removeAll()
+        }
+
+        // Reset buffer pool
+        pixelBufferPool = nil
+        poolSize = nil
     }
 
     // MARK: - Compositing
